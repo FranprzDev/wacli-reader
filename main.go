@@ -21,7 +21,29 @@ var chatRe = regexp.MustCompile(`^[A-Za-z0-9+][A-Za-z0-9@._+ -]{0,63}$`)
 var dateRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
 var phoneRe = regexp.MustCompile(`^\d{8,15}$`)
 
-const qrPrefix = "https://wa.me/settings/linked_devices#"
+// v0.26.0 internal/out/events.go and cmd/wacli/auth.go define this contract.
+// Only qr_code events are retained; all other lifecycle and bootstrap data is discarded.
+func qrEvent(line string) string {
+	var e struct {
+		Event string `json:"event"`
+		Data  struct {
+			Code string `json:"code"`
+		} `json:"data"`
+	}
+	if json.Unmarshal([]byte(line), &e) != nil || e.Event != "qr_code" {
+		return ""
+	}
+	code := e.Data.Code
+	if len(code) < 7 || len(code) > 2048 || !strings.HasPrefix(code, "2@") {
+		return ""
+	}
+	for _, c := range code[2:] {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("+/=,-_", c)) {
+			return ""
+		}
+	}
+	return code
+}
 
 type account struct {
 	Authenticated bool   `json:"authenticated"`
@@ -234,15 +256,15 @@ func (s *server) routes() http.Handler {
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), s.authTimeout)
-		cmd := s.cmd(ctx, false, "auth", "--qr-format", "text", "--idle-exit", "10s", "--history-days", strconv.Itoa(s.days), "--history-max-per-chat", strconv.Itoa(s.maxChat))
-		pipe, e := cmd.StdoutPipe()
+		cmd := s.cmd(ctx, false, "--events", "auth", "--qr-format", "terminal", "--idle-exit", "10s", "--history-days", strconv.Itoa(s.days), "--history-max-per-chat", strconv.Itoa(s.maxChat))
+		pipe, e := cmd.StderrPipe()
 		if e != nil {
 			s.end("auth_failed")
 			cancel()
 			http.Error(w, "start failed", 500)
 			return
 		}
-		// stderr is discarded: no logs, message bodies or identifiers exposed.
+		// stdout is discarded; stderr is parsed strictly as typed qr_code NDJSON only.
 		if e = cmd.Start(); e != nil {
 			s.end("auth_failed")
 			cancel()
@@ -254,16 +276,16 @@ func (s *server) routes() http.Handler {
 			scan := bufio.NewScanner(pipe)
 			scan.Buffer(make([]byte, 4096), 8192)
 			for scan.Scan() {
-				line := scan.Text()
-				if strings.HasPrefix(line, qrPrefix) && len(line) < 2048 && !strings.ContainsAny(line, " \t\r\n") {
+				code := qrEvent(scan.Text())
+				if code != "" {
 					s.mu.Lock()
-					s.qr = line
+					s.qr = code
 					s.mu.Unlock()
 				}
 			}
-			err := cmd.Wait()
+			_ = cmd.Wait()
 			state := "auth_failed"
-			if err == nil {
+			{
 				a, e := s.status()
 				if e == nil && s.match(a) {
 					state = "paired"

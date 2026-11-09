@@ -21,7 +21,7 @@ func fixture(t *testing.T) (*server, string, string) {
 printf '%s\n' "$*" >> '` + calls + `'
 case "$*" in
  *'auth status'*) cat '` + status + `';;
- *' auth '*) printf 'PRIVATE_BOOTSTRAP_BODY\nhttps://wa.me/settings/linked_devices#testqr\n'; sleep 0.15; exit 1;;
+ *' auth '*) printf 'PRIVATE_BOOTSTRAP_BODY\n{"event":"message","data":{"body":"PRIVATE_BOOTSTRAP_BODY"}}\n{"event":"qr_code","data":{"code":"2@test-code"},"ts":123}\n' >&2; sleep 0.15; exit 1;;
  *) printf '{"success":true,"data":[]}';;
 esac
 `
@@ -144,7 +144,7 @@ func TestPairingFailureNoLeakNoSync(t *testing.T) {
 		time.Sleep(15 * time.Millisecond)
 	}
 	w = request(s, "GET", "/auth/output", s.token)
-	if strings.Contains(w.Body.String(), "testqr") || !strings.Contains(w.Body.String(), "auth_failed") {
+	if strings.Contains(w.Body.String(), "2@test-code") || !strings.Contains(w.Body.String(), "auth_failed") {
 		t.Fatal(w.Body.String())
 	}
 	b, _ := os.ReadFile(calls)
@@ -174,3 +174,31 @@ func TestStatusRedaction(t *testing.T) {
 }
 
 var _ http.Handler
+
+// Upstream TestAuthQRWriterText uses literal 2@test-code; events.go wraps it as below.
+func TestUpstreamQREventContract(t *testing.T) {
+	good := `{"event":"qr_code","data":{"code":"2@test-code"},"ts":123}`
+	if qrEvent(good) != "2@test-code" {
+		t.Fatal("upstream raw 2@ payload not captured")
+	}
+	for _, line := range []string{`2@test-code`, `{"event":"message","data":{"code":"2@test-code","body":"private"}}`, `{"event":"qr_code","data":{"code":"https://wa.me/settings/linked_devices#fake"}}`, `{"event":"qr_code","data":{"code":"2@bad space"}}`, `{"event":"qr_code","data":{"code":"2@bad\nline"}}`, `not json`, `{"event":"qr_code","data":{"code":"2@` + strings.Repeat("x", 2049) + `"}}`} {
+		if qrEvent(line) != "" {
+			t.Fatal("accepted invalid QR", line)
+		}
+	}
+}
+func TestLinkedAccountDespiteBootstrapExit(t *testing.T) {
+	s, p, _ := fixture(t)
+	writeStatus(t, p, "", false)
+	w := request(s, "POST", "/auth/start", s.token)
+	if w.Code != 200 {
+		t.Fatal(w.Code)
+	}
+	time.Sleep(50 * time.Millisecond)
+	writeStatus(t, p, s.phone, true)
+	time.Sleep(180 * time.Millisecond)
+	w = request(s, "GET", "/auth/output", s.token)
+	if !strings.Contains(w.Body.String(), `"state":"paired"`) {
+		t.Fatal(w.Body.String())
+	}
+}
